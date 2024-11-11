@@ -167,26 +167,37 @@ func (s *Service) UpdateHead(ctx context.Context, proposingSlot primitives.Slot)
 // This processes fork choice attestations from the pool to account for validator votes and fork choice.
 func (s *Service) processAttestations(ctx context.Context, disparity time.Duration) {
 	atts := s.cfg.AttPool.ForkchoiceAttestations()
+
+	attStat := AttestationVerifyStat{}
+
 	for _, a := range atts {
 		// Based on the spec, don't process the attestation until the subsequent slot.
 		// This delays consideration in the fork choice until their slot is in the past.
 		// https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/fork-choice.md#validate_on_attestation
 		nextSlot := a.GetData().Slot + 1
 		if err := slots.VerifyTime(uint64(s.genesisTime.Unix()), nextSlot, disparity); err != nil {
+			attStat.Failure(err.Error())
+
 			continue
 		}
 
 		hasState := s.cfg.BeaconDB.HasStateSummary(ctx, bytesutil.ToBytes32(a.GetData().BeaconBlockRoot))
 		hasBlock := s.hasBlock(ctx, bytesutil.ToBytes32(a.GetData().BeaconBlockRoot))
 		if !(hasState && hasBlock) {
+			attStat.Failure("block or state summary not found")
+
 			continue
 		}
 
 		if err := s.cfg.AttPool.DeleteForkchoiceAttestation(a); err != nil {
 			log.WithError(err).Error("Could not delete fork choice attestation in pool")
+
+			attStat.Failure(err.Error())
 		}
 
 		if !helpers.VerifyCheckpointEpoch(a.GetData().Target, s.genesisTime) {
+			attStat.Failure("verify checkpoint epoch failed")
+
 			continue
 		}
 
@@ -211,8 +222,20 @@ func (s *Service) processAttestations(ctx context.Context, disparity time.Durati
 				}
 			}
 			log.WithFields(fields).WithError(err).Warn("Could not process attestation for fork choice")
+
+			attStat.Failure(err.Error())
 		}
+
+		attStat.Successful()
 	}
+
+	attrStats := attStat.Stats()
+
+	log.WithFields(logrus.Fields{
+		"successfulCount": attrStats.SuccessfulCount,
+		"failureCount":    attrStats.FailureCount,
+		"failureReasons":  attrStats.FailureReasons,
+	}).Debug("Processed attestations")
 }
 
 // receiveAttestationNoPubsub is a function that defines the operations that are performed on
